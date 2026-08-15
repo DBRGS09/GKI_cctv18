@@ -80,6 +80,16 @@ on:
         required: true
         type: boolean
         default: false
+      use_adios:
+        description: "启用 ADIOS IO 调度器支持(提升IO读写性能)"
+        required: true
+        type: boolean
+        default: false
+      use_kpm:
+        description: "开启 KPM(使用KpatchNext独立实现kpm; 支持任意KSU/面具环境)"
+        required: true
+        type: boolean
+        default: false
       use_rekernel:
         description: "启用 Re-Kernel 驱动"
         required: false
@@ -123,6 +133,8 @@ jobs:
       build_time: ${{ inputs.build_time || '' }}
       use_zram: ${{ inputs.use_zram }}
       use_bbg: ${{ inputs.use_bbg }}
+      use_adios: ${{ inputs.use_adios }}
+      use_kpm: ${{ inputs.use_kpm }}
       use_rekernel: ${{ inputs.use_rekernel || false }}
       supp_op: ${{ inputs.supp_op || false }}
       enable_susfs: ${{ !inputs.cancel_susfs }}

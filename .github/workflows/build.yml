@@ -69,6 +69,16 @@ on:
         required: true
         type: boolean
         default: true
+      use_adios:
+        description: "启用 ADIOS IO 调度器"
+        required: false
+        type: boolean
+        default: false
+      use_kpm:
+        description: "启用 KPatch-Next 独立 KPM（刷入后可用 kpn；非 ReSukiSU 内置 CONFIG_KPM）"
+        required: false
+        type: boolean
+        default: false
       supp_op:
         required: false
         type: boolean
@@ -110,6 +120,8 @@ jobs:
           echo "ZRAM 增强     : ${{ inputs.use_zram }}"
           echo "BBG 补丁      : ${{ inputs.use_bbg }}"
           echo "Re-Kernel     : ${{ inputs.use_rekernel }}"
+          echo "ADIOS IO      : ${{ inputs.use_adios }}"
+          echo "KPM(KPatchNext): ${{ inputs.use_kpm }}"
           echo "Droidspaces   : ${{ inputs.droidspaces }}"
           echo "Stock Config  : 自动检测 config/stock_defconfig"
           echo "========================================"
@@ -1028,6 +1040,30 @@ jobs:
           grep -q '^CONFIG_REKERNEL=y$' "$DEFCONFIG" || echo "CONFIG_REKERNEL=y" >> "$DEFCONFIG"
           grep -q '^CONFIG_REKERNEL_NETWORK=y$' "$DEFCONFIG" || echo "CONFIG_REKERNEL_NETWORK=y" >> "$DEFCONFIG"
 
+      # ==================== 应用 ADIOS IO 调度器 ====================
+      - name: 应用 ADIOS IO 调度器补丁
+        if: inputs.use_adios
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          set -e
+          echo "应用 firelzrd/adios 补丁（6.12.x）..."
+          rm -rf adios_src
+          git clone --depth=1 https://github.com/firelzrd/adios.git adios_src
+          cd common
+          # 6.12.69 优先用最接近的 6.12.44 稳定补丁；失败不阻断时可看 rejects
+          if ! patch -p1 -F3 --forward < ../adios_src/patches/stable/0001-linux6.12.44-ADIOS-3.2.0.patch; then
+            echo "::warning::ADIOS 6.12.44 补丁未完全匹配 6.12.${{ inputs.sub_level }}，尝试继续编译"
+          fi
+          if [ -f ../adios_src/patches/0002-Make-ADIOS-the-Default-I-O-scheduler.patch ]; then
+            patch -p1 -F3 --forward < ../adios_src/patches/0002-Make-ADIOS-the-Default-I-O-scheduler.patch || true
+          fi
+          cd "$KERNEL_ROOT"
+          {
+            echo "CONFIG_MQ_IOSCHED_ADIOS=y"
+            echo "CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y"
+          } >> "$DEFCONFIG"
+          echo "ADIOS 配置已写入 defconfig"
+
       # ==================== 配置内核选项 ====================
       # 添加 KernelSU 和其他必要的内核配置
       - name: 配置内核选项
@@ -1039,15 +1075,8 @@ jobs:
           CONFIG_TMPFS_POSIX_ACL=y
           EOF
 
-          if [ "${{ inputs.ksu_variant }}" == "SukiSU" ] || [ "${{ inputs.ksu_variant }}" == "ReSukiSU" ] || [ "${{ inputs.ksu_variant }}" == "Next" ]; then
-            if [[ "${{ inputs.use_kpm }}" == enabled* ]] || [[ "${{ inputs.use_kpm }}" == patched* ]]; then
-              if ! grep -RqsE '^[[:space:]]*config[[:space:]]+KPM([[:space:]]|$)' common KernelSU 2>/dev/null; then
-                echo "错误: 已请求启用 KPM，但当前 KernelSU 代码未声明 CONFIG_KPM" >&2
-                exit 1
-              fi
-              echo "CONFIG_KPM=y" >> "$DEFCONFIG"
-            fi
-          fi
+          # 注意: use_kpm 走 KPatch-Next 后处理 Image，不启用 ReSukiSU 内置 CONFIG_KPM
+          # （二者不宜同时使用）
 
           CURRENT_SUB="${{ inputs.sub_level }}"
           if [[ ! "$CURRENT_SUB" =~ ^[0-9]+$ ]]; then
@@ -1258,17 +1287,48 @@ jobs:
           fi
 
           cp "$SRC_DIR/Image" ./bootimgs/
-          cp "$SRC_DIR/Image.lz4" ./bootimgs/
+          cp "$SRC_DIR/Image.lz4" ./bootimgs/ 2>/dev/null || true
           cp "$SRC_DIR/Image" ./
-          cp "$SRC_DIR/Image.lz4" ./
+          if [ -f "$SRC_DIR/Image.lz4" ]; then
+            cp "$SRC_DIR/Image.lz4" ./
+          fi
           gzip -n -k -f -9 ./Image > ./Image.gz
+
+      # ==================== KPatch-Next 独立 KPM ====================
+      - name: 应用 KPatch-Next (KPM)
+        if: inputs.use_kpm
+        run: |
+          set -e
+          echo "使用 KPatch-Next 修补 Image..."
+          wget -q https://github.com/KernelSU-Next/KPatch-Next/releases/latest/download/kptools-linux
+          wget -q https://github.com/KernelSU-Next/KPatch-Next/releases/latest/download/kpimg-linux
+          chmod +x ./kptools-linux
+          ./kptools-linux -p -i ./Image -k ./kpimg-linux -o ./oImage
+          rm -f Image
+          mv oImage Image
+          # 同步 bootimgs / lz4 / gz
+          cp ./Image ./bootimgs/Image
+          if command -v lz4 >/dev/null 2>&1; then
+            lz4 -f -12 ./Image ./Image.lz4 || true
+            cp ./Image.lz4 ./bootimgs/Image.lz4 2>/dev/null || true
+          fi
+          gzip -n -k -f -9 ./Image > ./Image.gz
+          rm -f kptools-linux kpimg-linux
+          echo "KPatch-Next 修补完成"
 
       # ==================== 创建 AnyKernel3 压缩包 ====================
       - name: 创建 AnyKernel3 压缩包
         run: |
           cd $ANYKERNEL3
-          ZIP_NAME="${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-AnyKernel3.zip"
+          SUFFIX=""
+          if [ "${{ inputs.use_adios }}" == "true" ]; then SUFFIX="${SUFFIX}-adios"; fi
+          if [ "${{ inputs.use_kpm }}" == "true" ]; then SUFFIX="${SUFFIX}-kpm"; fi
+          ZIP_NAME="${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}${SUFFIX}-AnyKernel3.zip"
           mv ../Image ./Image
+          if [ "${{ inputs.use_kpm }}" == "true" ]; then
+            wget -q https://github.com/cctv18/KPatch-Next/releases/latest/download/kpn.zip || \
+              wget -q https://github.com/KernelSU-Next/KPatch-Next/releases/latest/download/kpn.zip || true
+          fi
           zip -r "../$ZIP_NAME" ./*
 
       # ==================== 构建 Boot 镜像 (Android 12) ====================
